@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Lumonitor
+GenericName=Brightness Control
+Comment=Adjust monitor brightness with an easy-to-use interface
+Icon=display-brightness-symbolic
+Exec=python3 /home/suleyman/Developer/Lumonitor/lumonitor.py
+Terminal=false
+Categories=Settings;System;
+Keywords=brightness;monitor;display;backlight;
+StartupNotify=true

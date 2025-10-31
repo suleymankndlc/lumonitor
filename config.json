@@ -1,0 +1,21 @@
+{
+    "brightness": {
+        "default_level": 1.0,
+        "step_size": 0.1,
+        "min_brightness": 0.1,
+        "max_brightness": 1.0,
+        "remember_settings": true
+    },
+    "hotkeys": {
+        "enabled": true,
+        "increase": "<ctrl>+<alt>+<up>",
+        "decrease": "<ctrl>+<alt>+<down>", 
+        "reset": "<ctrl>+<alt>+<shift>+r"
+    },
+    "ui": {
+        "show_tray": true,
+        "start_minimized": false,
+        "theme": "auto"
+    },
+    "monitors": {}
+}
