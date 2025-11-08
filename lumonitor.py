@@ -15,6 +15,10 @@ import os
 import re
 from typing import List, Dict, Optional
 import argparse
+from pathlib import Path
+import threading
+from queue import Queue
+import time
 
 
 class BrightnessController:
@@ -24,6 +28,64 @@ class BrightnessController:
         self.use_ddcutil = self.check_ddcutil_available()
         self.monitors = self.get_monitors()
         self.brightness_cache = {}
+        self.cache_dir = Path.home() / '.cache' / 'lumonitor'
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Thread-safe queue for brightness changes
+        self.pending_changes = {}  # monitor -> (brightness, timestamp)
+        self.change_lock = threading.Lock()
+        self.worker_thread = None
+        self.running = True
+        
+        # Start background worker
+        self._start_worker()
+        
+    def _start_worker(self):
+        """Start background worker thread for applying brightness changes"""
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
+    
+    def _worker_loop(self):
+        """Background worker that applies brightness changes"""
+        while self.running:
+            time.sleep(0.05)  # Check every 50ms
+            
+            with self.change_lock:
+                if not self.pending_changes:
+                    continue
+                    
+                # Process all pending changes
+                to_apply = dict(self.pending_changes)
+                self.pending_changes.clear()
+            
+            # Apply changes outside the lock (can be slow)
+            for monitor, (brightness, _) in to_apply.items():
+                self._apply_brightness_hardware(monitor, brightness)
+        
+    def _get_cache_file(self, monitor: str) -> Path:
+        """Get cache file path for a monitor"""
+        # Sanitize monitor name for filename
+        safe_name = monitor.replace('/', '_').replace(' ', '_')
+        return self.cache_dir / f'brightness_{safe_name}'
+    
+    def _read_cached_brightness(self, monitor: str) -> Optional[float]:
+        """Read brightness from cache file"""
+        cache_file = self._get_cache_file(monitor)
+        try:
+            if cache_file.exists():
+                value = float(cache_file.read_text().strip())
+                return max(0.0, min(1.0, value))
+        except (ValueError, IOError):
+            pass
+        return None
+    
+    def _write_cached_brightness(self, monitor: str, brightness: float):
+        """Write brightness to cache file"""
+        cache_file = self._get_cache_file(monitor)
+        try:
+            cache_file.write_text(f"{brightness:.2f}\n")
+        except IOError:
+            pass
         
     def check_ddcutil_available(self) -> bool:
         """Check if ddcutil is available and working"""
@@ -113,10 +175,20 @@ class BrightnessController:
     
     def get_brightness(self, monitor: str) -> float:
         """Get current brightness for a monitor (0.0 to 1.0)"""
+        # İlk önce cache'i kontrol et
+        cached = self._read_cached_brightness(monitor)
+        if cached is not None:
+            return cached
+        
+        # Cache yoksa ddcutil veya xrandr'dan oku
         if self.use_ddcutil:
-            return self.get_ddcutil_brightness(monitor)
+            brightness = self.get_ddcutil_brightness(monitor)
         else:
-            return self.brightness_cache.get(monitor, 1.0)
+            brightness = self.brightness_cache.get(monitor, 1.0)
+        
+        # Cache'e yaz
+        self._write_cached_brightness(monitor, brightness)
+        return brightness
     
     def get_ddcutil_brightness(self, monitor: str) -> float:
         """Get brightness using ddcutil with sudo"""
@@ -151,17 +223,28 @@ class BrightnessController:
         return self.brightness_cache.get(monitor, 1.0)
     
     def set_brightness(self, monitor: str, brightness: float):
-        """Set brightness for a monitor (0.0 to 1.0)"""
+        """Set brightness for a monitor (0.0 to 1.0) - immediate cache update, async hardware"""
         # Clamp brightness between 0.1 and 1.0
         brightness = max(0.1, min(1.0, brightness))
         
+        # İlk önce cache'e yaz (anında UI response)
+        self._write_cached_brightness(monitor, brightness)
+        
+        # Memory cache'i de güncelle
+        self.brightness_cache[monitor] = brightness
+        
+        # Hardware değişikliğini queue'ya ekle (async)
+        with self.change_lock:
+            self.pending_changes[monitor] = (brightness, time.time())
+        
+        return True
+    
+    def _apply_brightness_hardware(self, monitor: str, brightness: float):
+        """Actually apply brightness to hardware (called from worker thread)"""
         if self.use_ddcutil:
-            success = self.set_ddcutil_brightness(monitor, brightness)
-            if success:
-                return True
-                
-        # Fallback to xrandr
-        return self.set_xrandr_brightness(monitor, brightness)
+            self.set_ddcutil_brightness(monitor, brightness)
+        else:
+            self.set_xrandr_brightness(monitor, brightness)
     
     def set_ddcutil_brightness(self, monitor: str, brightness: float) -> bool:
         """Set brightness using ddcutil with sudo"""
@@ -183,6 +266,7 @@ class BrightnessController:
             subprocess.run(['sudo', 'ddcutil', '--display', ddcutil_id, 'setvcp', '10', str(brightness_percent)], 
                           check=True, capture_output=True)
             
+            # Başarılı olursa memory cache'i de güncelle
             self.brightness_cache[monitor] = brightness
             return True
             
@@ -195,6 +279,7 @@ class BrightnessController:
         try:
             subprocess.run(['xrandr', '--output', monitor, '--brightness', str(brightness)], 
                           check=True)
+            # Memory cache'i güncelle
             self.brightness_cache[monitor] = brightness
             return True
         except subprocess.CalledProcessError as e:
@@ -214,74 +299,129 @@ class LumonitorGUI:
         # Debounce mechanism for slider changes
         self.pending_changes = {}  # monitor_name -> brightness_value
         self.change_timers = {}    # monitor_name -> timer_id
-        self.debounce_delay = 300  # milliseconds
+        self.debounce_delay = 500  # milliseconds - increased for smoother feel
         
         self.setup_window()
     
     def setup_window(self):
         """Create and setup the main window"""
-        self.window = Gtk.Window(title="Lumonitor - Brightness Control")
-        self.window.set_default_size(400, 300)
-        self.window.set_border_width(15)
+        self.window = Gtk.Window(title="Lumonitor")
+        self.window.set_default_size(520, 380)
+        self.window.set_border_width(0)
         self.window.connect("delete-event", self.on_window_delete)
         
-        # Create main container
-        vbox = Gtk.VBox(spacing=10)
-        self.window.add(vbox)
+        # Modern window styling
+        self.window.set_resizable(False)
         
-        # Title
+        # Modern window styling
+        self.window.set_resizable(False)
+        
+        # Main container with padding
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.window.add(main_box)
+        
+        # Header section
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        header.set_name("header")
+        main_box.pack_start(header, False, False, 0)
+        
+        # Title with icon
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        title_box.set_margin_start(24)
+        title_box.set_margin_end(24)
+        title_box.set_margin_top(24)
+        title_box.set_margin_bottom(16)
+        
+        icon = Gtk.Image.new_from_icon_name("display-brightness-symbolic", Gtk.IconSize.LARGE_TOOLBAR)
+        icon.set_pixel_size(24)
+        title_box.pack_start(icon, False, False, 0)
+        
         title_label = Gtk.Label()
-        title_label.set_markup("<b><big>Lumonitor</big></b>")
-        vbox.pack_start(title_label, False, False, 0)
+        title_label.set_markup("<span size='14000' weight='600'>Lumonitor</span>")
+        title_label.set_halign(Gtk.Align.START)
+        title_box.pack_start(title_label, True, True, 0)
+        
+        header.pack_start(title_box, False, False, 0)
+        
+        # Separator
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        separator.set_name("header-separator")
+        header.pack_start(separator, False, False, 0)
+        
+        # Content area
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        content.set_margin_start(24)
+        content.set_margin_end(24)
+        content.set_margin_top(24)
+        content.set_margin_bottom(24)
+        main_box.pack_start(content, True, True, 0)
+        
+        content.set_margin_bottom(24)
+        main_box.pack_start(content, True, True, 0)
         
         # Monitors section
         for monitor in self.brightness_controller.monitors:
             monitor_frame = self.create_monitor_control(monitor)
-            vbox.pack_start(monitor_frame, False, False, 0)
+            content.pack_start(monitor_frame, False, False, 0)
         
-        # Control buttons
-        button_box = Gtk.HBox(spacing=10)
-        vbox.pack_end(button_box, False, False, 0)
+        # Footer with buttons
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        footer.set_margin_start(24)
+        footer.set_margin_end(24)
+        footer.set_margin_bottom(24)
+        footer.set_margin_top(8)
+        main_box.pack_end(footer, False, False, 0)
         
-        # Reset button
-        reset_btn = Gtk.Button(label="Reset All")
+        # Reset button (secondary style)
+        reset_btn = Gtk.Button(label="🔄  Reset")
+        reset_btn.set_name("secondary-button")
         reset_btn.connect("clicked", self.on_reset_clicked)
-        button_box.pack_start(reset_btn, True, True, 0)
+        footer.pack_start(reset_btn, False, False, 0)
         
-        # Hide button
-        hide_btn = Gtk.Button(label="Hide to Tray")
+        # Spacer
+        footer.pack_start(Gtk.Box(), True, True, 0)
+        
+        # Hide button (secondary style)
+        hide_btn = Gtk.Button(label="📥  Hide to Tray")
+        hide_btn.set_name("secondary-button")
         hide_btn.connect("clicked", self.on_hide_clicked)
-        button_box.pack_start(hide_btn, True, True, 0)
+        footer.pack_start(hide_btn, False, False, 0)
         
-        # Close button
+        # Close button (ghost style)
         close_btn = Gtk.Button(label="Close")
+        close_btn.set_name("ghost-button")
         close_btn.connect("clicked", self.on_close_clicked)
-        button_box.pack_start(close_btn, True, True, 0)
+        footer.pack_start(close_btn, False, False, 0)
     
     def create_monitor_control(self, monitor: Dict[str, str]):
         """Create brightness control for a single monitor"""
-        frame = Gtk.Frame(label=monitor['display_name'])
-        frame.set_border_width(5)
+        # Card container
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.set_name("card")
         
-        vbox = Gtk.VBox(spacing=5)
-        vbox.set_border_width(10)
-        frame.add(vbox)
+        # Monitor name/label
+        name_label = Gtk.Label(label=monitor['display_name'])
+        name_label.set_name("monitor-label")
+        name_label.set_halign(Gtk.Align.START)
+        card.pack_start(name_label, False, False, 0)
         
-        # Brightness slider
-        hbox = Gtk.HBox(spacing=10)
-        vbox.pack_start(hbox, False, False, 0)
+        # Slider container
+        slider_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        card.pack_start(slider_box, False, False, 0)
         
-        # Label
-        label = Gtk.Label(label="Brightness:")
-        label.set_size_request(80, -1)
-        hbox.pack_start(label, False, False, 0)
+        # Brightness icon
+        icon = Gtk.Image.new_from_icon_name("display-brightness-symbolic", Gtk.IconSize.BUTTON)
+        icon.set_opacity(0.6)
+        slider_box.pack_start(icon, False, False, 0)
         
         # Slider
         adjustment = Gtk.Adjustment(value=100, lower=10, upper=100, 
                                   step_increment=1, page_increment=10)
         slider = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment)
+        slider.set_name("brightness-slider")
         slider.set_digits(0)
         slider.set_value_pos(Gtk.PositionType.RIGHT)
+        slider.set_draw_value(True)
         slider.set_hexpand(True)
         
         # Get current brightness and set slider
@@ -289,17 +429,18 @@ class LumonitorGUI:
         slider.set_value(current_brightness * 100)
         
         slider.connect("value-changed", self.on_brightness_changed, monitor['name'])
-        hbox.pack_start(slider, True, True, 0)
+        slider_box.pack_start(slider, True, True, 0)
         
         self.sliders[monitor['name']] = slider
         
-        return frame
+        return card
     
     def on_brightness_changed(self, slider, monitor_name):
         """Handle brightness slider change with debounce"""
         if self.is_updating:
             return
-            
+        
+        # Update UI immediately for smooth feel
         brightness = slider.get_value() / 100.0
         
         # Store the pending change
@@ -400,23 +541,28 @@ class LumonitorTray:
         menu = Gtk.Menu()
         
         # Show/Hide GUI
-        show_item = Gtk.MenuItem(label="Show Lumonitor")
+        show_item = Gtk.MenuItem(label="🎛  Open Lumonitor")
         show_item.connect("activate", self.on_show_gui)
         menu.append(show_item)
         
         menu.append(Gtk.SeparatorMenuItem())
         
-        # Quick brightness controls
-        brightness_levels = [100, 75, 50, 25]
-        for level in brightness_levels:
-            item = Gtk.MenuItem(label=f"Set Brightness to {level}%")
+        # Quick brightness controls with emojis
+        brightness_levels = [
+            (100, "☀️  100%"),
+            (75, "🔆  75%"),
+            (50, "🔅  50%"),
+            (25, "🌙  25%")
+        ]
+        for level, label in brightness_levels:
+            item = Gtk.MenuItem(label=label)
             item.connect("activate", self.on_quick_brightness, level)
             menu.append(item)
         
         menu.append(Gtk.SeparatorMenuItem())
         
         # Quit
-        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item = Gtk.MenuItem(label="❌  Quit Lumonitor")
         quit_item.connect("activate", self.on_quit)
         menu.append(quit_item)
         
@@ -441,9 +587,10 @@ class LumonitorTray:
 class Lumonitor:
     """Main application class"""
     
-    def __init__(self, show_tray=True):
+    def __init__(self, show_tray=True, start_minimized=False):
         self.brightness_controller = BrightnessController()
         self.gui = LumonitorGUI(self.brightness_controller)
+        self.start_minimized = start_minimized
         
         if show_tray:
             self.tray = LumonitorTray(self.gui, self.brightness_controller)
@@ -452,21 +599,182 @@ class Lumonitor:
     
     def run(self):
         """Run the application"""
-        self.gui.show()
+        if not self.start_minimized:
+            self.gui.show()
         
-        # Setup CSS for better looks
+        # Modern shadcn-inspired CSS
         css_provider = Gtk.CssProvider()
         css_provider.load_from_data(b"""
+            /* Modern color palette - shadcn inspired */
             window {
-                background-color: #f6f5f4;
+                background-color: #fafafa;
             }
-            frame {
-                background-color: white;
-                border-radius: 6px;
-                border: 1px solid #d1d5db;
+            
+            #header {
+                background: linear-gradient(to bottom, #ffffff 0%, #fafafa 100%);
             }
-            scale {
-                min-width: 200px;
+            
+            #header-separator {
+                background-color: #e5e5e5;
+                min-height: 1px;
+            }
+            
+            /* Card styling - subtle shadow, rounded corners */
+            #card {
+                background-color: #ffffff;
+                border-radius: 12px;
+                padding: 20px;
+                border: 1px solid #e5e5e5;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+            }
+            
+            #card:hover {
+                border-color: #d4d4d4;
+                box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+                transition: all 150ms ease;
+            }
+            
+            /* Monitor label */
+            #monitor-label {
+                color: #18181b;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            
+            /* Slider styling - modern accent */
+            #brightness-slider slider {
+                background-color: #18181b;
+                border-radius: 8px;
+                min-width: 18px;
+                min-height: 18px;
+                margin: -7px;
+                transition: all 100ms ease;
+            }
+            
+            #brightness-slider slider:hover {
+                background-color: #3b82f6;
+                min-width: 20px;
+                min-height: 20px;
+            }
+            
+            #brightness-slider trough {
+                background-color: #e5e5e5;
+                border-radius: 8px;
+                min-height: 4px;
+            }
+            
+            #brightness-slider highlight {
+                background: linear-gradient(90deg, #3b82f6 0%, #2563eb 100%);
+                border-radius: 8px;
+                transition: all 100ms ease;
+            }
+            
+            #brightness-slider value {
+                color: #71717a;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            
+            /* Button styles - shadcn inspired */
+            button {
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: 500;
+                font-size: 14px;
+                min-height: 36px;
+                transition: all 150ms ease;
+            }
+            
+            #secondary-button {
+                background: #f4f4f5;
+                color: #18181b;
+                border: 1px solid #e4e4e7;
+            }
+            
+            #secondary-button:hover {
+                background: #e4e4e7;
+                border-color: #d4d4d8;
+            }
+            
+            #secondary-button:active {
+                background: #d4d4d8;
+            }
+            
+            #ghost-button {
+                background: transparent;
+                color: #71717a;
+                border: none;
+            }
+            
+            #ghost-button:hover {
+                background: #f4f4f5;
+                color: #18181b;
+            }
+            
+            #ghost-button:active {
+                background: #e4e4e7;
+            }
+            
+            /* Dialog specific styles */
+            #dialog-header {
+                background: linear-gradient(to bottom, #ffffff 0%, #fafafa 100%);
+            }
+            
+            #dialog-separator {
+                background-color: #e5e5e5;
+                min-height: 1px;
+            }
+            
+            #shortcut-label {
+                color: #18181b;
+                font-weight: 500;
+                font-size: 13px;
+            }
+            
+            #shortcut-entry {
+                border-radius: 8px;
+                border: 1px solid #e4e4e7;
+                padding: 8px 12px;
+                background-color: #ffffff;
+                font-size: 13px;
+                min-height: 36px;
+            }
+            
+            #shortcut-entry:focus {
+                border-color: #3b82f6;
+                box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+            }
+            
+            /* Primary button - accent */
+            #primary-button {
+                background: linear-gradient(to bottom, #3b82f6 0%, #2563eb 100%);
+                color: #ffffff;
+                border: none;
+                font-weight: 600;
+            }
+            
+            #primary-button:hover {
+                background: linear-gradient(to bottom, #2563eb 0%, #1d4ed8 100%);
+            }
+            
+            #primary-button:active {
+                background: #1d4ed8;
+            }
+            
+            /* Destructive button - red */
+            #destructive-button {
+                background: transparent;
+                color: #dc2626;
+                border: 1px solid #fca5a5;
+            }
+            
+            #destructive-button:hover {
+                background: #fef2f2;
+                border-color: #f87171;
+            }
+            
+            #destructive-button:active {
+                background: #fee2e2;
             }
         """)
         
@@ -493,6 +801,8 @@ def main():
                        help="Adjust brightness by step (+0.1, -0.1) and exit")
     parser.add_argument("--monitor", type=str, metavar="NAME",
                        help="Specify monitor name (use with --brightness)")
+    parser.add_argument("--minimized", action="store_true",
+                       help="Start minimized to system tray")
     
     args = parser.parse_args()
     
@@ -526,7 +836,7 @@ def main():
         return
     
     # GUI mode
-    app = Lumonitor(show_tray=not args.no_tray)
+    app = Lumonitor(show_tray=not args.no_tray, start_minimized=args.minimized)
     app.run()
 
 

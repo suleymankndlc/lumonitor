@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumonitor"
+version = "0.1.0"
+description = "Lightweight brightness control utility for Linux"
+authors = [ { name = "Lumonitor" } ]
+readme = "README.md"
+requires-python = ">=3.8"
+
+[tool.setuptools]
+package-dir = {"" = "."}

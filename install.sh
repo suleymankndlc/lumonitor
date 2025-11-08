@@ -121,14 +121,31 @@ Keywords=brightness;monitor;display;backlight;
 StartupNotify=true
 EOF
     
+    # Create autostart file
+    mkdir -p "$HOME/.config/autostart"
+    cat > "$HOME/.config/autostart/lumonitor.desktop" << EOF
+[Desktop Entry]
+Type=Application
+Name=Lumonitor
+GenericName=Brightness Control
+Comment=Brightness control utility running in system tray
+Icon=display-brightness-symbolic
+Exec=python3 $SCRIPT_DIR/lumonitor.py --minimized
+Terminal=false
+Categories=Utility;Settings;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+Hidden=false
+EOF
+    
     # Update desktop database
     if command -v update-desktop-database &> /dev/null; then
         update-desktop-database "$HOME/.local/share/applications"
     fi
     
     print_status "Local installation completed"
-    print_status "You can now run Lumonitor from your application menu"
-    print_status "Or run directly: python3 $SCRIPT_DIR/lumonitor.py"
+    print_status "Lumonitor will start automatically on next login (minimized to tray)"
+    print_status "You can also run: python3 $SCRIPT_DIR/lumonitor.py"
 }
 
 uninstall() {
@@ -143,6 +160,7 @@ uninstall() {
     
     # Remove local files
     rm -f "$LOCAL_DESKTOP"
+    rm -f "$HOME/.config/autostart/lumonitor.desktop"
     if command -v update-desktop-database &> /dev/null; then
         update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
     fi

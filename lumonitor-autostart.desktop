@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Lumonitor
+GenericName=Brightness Control
+Comment=Brightness control utility running in system tray
+Icon=display-brightness-symbolic
+Exec=python3 /home/suleyman/Developer/Lumonitor/lumonitor.py --minimized
+Terminal=false
+Categories=Utility;Settings;
+Keywords=brightness;monitor;display;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+Hidden=false
